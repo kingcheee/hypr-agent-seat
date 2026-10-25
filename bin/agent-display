@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# 에이전트 전용 헤드리스 출력(기본 AGENT-1)이 에이전트 워크스페이스(기본 99)를 항상 보여주게 한다.
+# 숨은 워크스페이스의 창은 Hyprland가 프레임 콜백을 보내지 않아 Electron 앱의 rAF가 0이 되고,
+# 입력·캡처가 반영되지 않는다. 헤드리스 출력에 띄우면 프레임이 계속 돈다.
+# 모니터·워크스페이스·창 규칙은 hypr/agent-seat.lua에 있다.
+#
+#   agent-display up      출력 생성 (이미 있으면 그대로) + ws 표시. 생성 직후 사용자 포커스·커서를 되돌린다.
+#   agent-display show    출력이 에이전트 ws를 보여주게 되돌린다(다른 ws가 걸렸을 때). 포커스·커서는 되돌린다.
+#   agent-display down    출력 제거 (그 ws의 창은 실제 모니터의 숨은 ws로 돌아간다)
+#   agent-display view    출력을 비추는 wl-mirror 창을 띄운다
+#   agent-display status  있는지·어느 ws를 보여주는지
+set -euo pipefail
+
+NAME=${AGENT_DISPLAY_NAME:-AGENT-1}
+WS=${AGENT_DISPLAY_WS:-99}
+
+exists() { hyprctl monitors -j | python3 -c "import json,sys; sys.exit(0 if any(m['name']=='$NAME' for m in json.load(sys.stdin)) else 1)"; }
+
+# 사용자 포커스·커서를 적어 두고 "$@"를 실행한 뒤 되돌린다 — 출력 생성·ws 전환은 포커스를 새 출력으로 가져간다.
+keep_focus() {
+  local win mon pos
+  win=$(hyprctl activewindow -j | python3 -c "import json,sys; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || true)
+  mon=$(hyprctl monitors -j | python3 -c "import json,sys; print(next(m['name'] for m in json.load(sys.stdin) if m['focused']))")
+  pos=$(hyprctl cursorpos | tr -d ' ')
+  "$@"
+  if [ -n "$win" ]; then
+    hyprctl dispatch "hl.dsp.focus({ window = 'address:$win' })" >/dev/null
+  else
+    hyprctl dispatch "hl.dsp.focus({ monitor = '$mon' })" >/dev/null
+  fi
+  hyprctl dispatch "hl.dsp.cursor.move({ x = ${pos%,*}, y = ${pos#*,} })" >/dev/null
+}
+
+shown() { hyprctl monitors -j | python3 -c "import json,sys; sys.exit(0 if any(m['name']=='$NAME' and str(m['activeWorkspace']['id'])=='$WS' for m in json.load(sys.stdin)) else 1)"; }
+
+show() { shown || keep_focus hyprctl dispatch "hl.dsp.focus({ workspace = '$WS' })" >/dev/null; }
+
+case "${1:-status}" in
+  up)
+    if ! exists; then
+      keep_focus hyprctl output create headless "$NAME" >/dev/null
+    fi
+    show
+    echo "$NAME up"
+    ;;
+  show)
+    exists || { echo "$NAME not up — run: agent-display up" >&2; exit 1; }
+    show
+    ;;
+  down)
+    exists || { echo "$NAME not up"; exit 0; }
+    # 출력을 지우면 Hyprland가 커서를 화면 중앙으로 옮긴다 — 되돌린다.
+    pos=$(hyprctl cursorpos | tr -d ' ')
+    hyprctl output remove "$NAME" >/dev/null
+    hyprctl dispatch "hl.dsp.cursor.move({ x = ${pos%,*}, y = ${pos#*,} })" >/dev/null
+    echo "$NAME down"
+    ;;
+  view)
+    exists || { echo "$NAME not up — run: agent-display up" >&2; exit 1; }
+    if command -v open-here >/dev/null; then open-here wl-mirror "$NAME"; else setsid -f wl-mirror "$NAME" >/dev/null 2>&1; fi
+    ;;
+  status)
+    hyprctl monitors -j | python3 -c "
+import json,sys
+m=[m for m in json.load(sys.stdin) if m['name']=='$NAME']
+print(f\"$NAME up at {m[0]['x']},{m[0]['y']} showing ws {m[0]['activeWorkspace']['id']}\" if m else '$NAME not up')"
+    ;;
+  *) echo "usage: agent-display [up|show|down|view|status]" >&2; exit 2 ;;
+esac
